@@ -1,0 +1,7 @@
+torch>=2.2
+numpy
+h5py
+tonic>=1.6
+torchaudio>=2.2
+matplotlib
+scipy

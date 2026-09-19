@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+cache/
+runs/
+probe/
+data/*
+!data/gsc_fbank_stats.npz
+*.npz
+!data/gsc_fbank_stats.npz
+*.png

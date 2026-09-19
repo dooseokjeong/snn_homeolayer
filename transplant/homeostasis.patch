@@ -1,0 +1,170 @@
+diff --git a/models/snns.py b/models/snns.py
+index 8f3e63d..cfd5020 100644
+--- a/models/snns.py
++++ b/models/snns.py
+@@ -20,6 +20,7 @@ import torch.nn as nn
+ import torch.nn.init as init
+ import torch.nn.functional as F
+ import math
++import torch.nn.utils.parametrize as parametrize
+ from einops import rearrange, repeat
+ 
+ # Try to import Mamba in case it is used
+@@ -217,6 +218,58 @@ class SNN(nn.Module):
+         return x, firing_rates, sop
+ 
+ 
++class L2Rows(nn.Module):
++    def forward(self, w):
++        return F.normalize(w, p=2, dim=1)
++
++
++class HomeostaticThreshold(nn.Module):
++    """The HomeoLayer controller in place of the layer's normalization: one threshold per sample,
++    theta <- theta + lr * phi_bar * (r_bar - r*), from the layer's spikes alone. r_bar is the mean
++    spike count and phi_bar the mean one-bit flip statistic, both over `window` steps and floored at
++    `phi_floor`; r* = target_min + (1 - target_min) sigmoid(rho) is trained. The threshold restarts
++    at `init` for every sequence and is detached between steps."""
++
++    def __init__(self, target=0.112, lr=10.0, window=5, phi_floor=1e-2, init=1.0, target_min=5e-3,
++                 learn_target=True):
++        super().__init__()
++        self.lr, self.window, self.phi_floor, self.init = float(lr), int(window), float(phi_floor), float(init)
++        self.target_min, self.learn_target = float(target_min), bool(learn_target)
++        self.target = float(target)
++        if self.learn_target:
++            t = min(max((self.target - self.target_min) / (1 - self.target_min), 1e-4), 1 - 1e-4)
++            self.rho = nn.Parameter(torch.tensor(math.log(t / (1 - t))))
++        self.theta = None
++
++    def start(self, batch_size, device, dtype):
++        """Begin a sequence: theta [B] at `init`, statistics cleared. Returns theta as [B, 1]."""
++        self.theta = torch.full((batch_size,), self.init, device=device, dtype=dtype)
++        self.prev = None
++        self._r, self._p = [], []
++        return self.theta.unsqueeze(1)
++
++    def step(self, st):
++        """Consume this timestep's spikes [B, N]; return the threshold for the next step, [B, 1]."""
++        with torch.no_grad():
++            r = st.mean(dim=1)
++            if self.prev is None:
++                phi = torch.full_like(r, self.phi_floor)
++            else:
++                flip = 0.5 * (self.prev * (1 - st) + (1 - self.prev) * st)
++                phi = flip.mean(dim=1).clamp(min=self.phi_floor)
++            self.prev = st.detach()
++            self._r.append(r)
++            self._p.append(phi)
++            if len(self._r) > self.window:
++                self._r.pop(0)
++                self._p.pop(0)
++            r_bar = torch.stack(self._r, 0).mean(0)
++            phi_bar = torch.stack(self._p, 0).mean(0)
++        target = (self.target_min + (1 - self.target_min) * torch.sigmoid(self.rho)) if self.learn_target else self.target
++        self.theta = self.theta.detach() + self.lr * phi_bar * (r_bar - target)
++        return self.theta.unsqueeze(1)
++
++
+ class SiLIFLayer(nn.Module):
+     """
+     A single layer of SSM-inspired Leaky Integrate-and-Fire (SiLIF) neurons.
+@@ -422,6 +475,11 @@ class CSiLIFLayer(nn.Module):
+         self.reset_factor = 0.5
+ 
+ 
++        self.homeo = None
++        if normalization == "homeostasis":
++            self.homeo = HomeostaticThreshold()
++            parametrize.register_parametrization(self.W, "weight", L2Rows())
++
+         # Initialize normalinzation
+         self.normalize = False
+         if normalization == "batchnorm":
+@@ -470,6 +528,11 @@ class CSiLIFLayer(nn.Module):
+         alpha_cont *=torch.exp(self.log_dt)
+         alpha = torch.exp(alpha_cont)         
+             
++        if self.homeo is not None:
++            thr = self.homeo.start(Wx.shape[0], Wx.device, Wx.real.dtype if Wx.is_complex() else Wx.dtype)
++        else:
++            thr = self.threshold
++
+         for t in range(Wx.shape[1]):
+ 
+             reset = st
+@@ -478,8 +541,10 @@ class CSiLIFLayer(nn.Module):
+             ut = alpha * (ut - self.reset_factor*reset) + self.b * Wx[:, t, :]
+ 
+             # Compute spikes with surrogate gradient
+-            st = self.spike_fct(2*ut.real - self.threshold)
++            st = self.spike_fct(2*ut.real - thr)
+             s.append(st)
++            if self.homeo is not None:
++                thr = self.homeo.step(st)
+         
+ 
+         return torch.stack(s, dim=1)
+@@ -1249,6 +1314,11 @@ class RadLIFLayer(nn.Module):
+         nn.init.uniform_(self.b, self.b_lim[0], self.b_lim[1])
+         nn.init.orthogonal_(self.V.weight)
+ 
++        self.homeo = None
++        if normalization == "homeostasis":
++            self.homeo = HomeostaticThreshold()
++            parametrize.register_parametrization(self.W, "weight", L2Rows())
++
+         # Initialize normalization
+         self.normalize = False
+         if normalization == "batchnorm":
+@@ -1312,6 +1382,11 @@ class RadLIFLayer(nn.Module):
+         # Set diagonal elements of recurrent matrix to zero
+         V = self.V.weight.clone().fill_diagonal_(0)
+ 
++        if self.homeo is not None:
++            thr = self.homeo.start(Wx.shape[0], Wx.device, Wx.real.dtype if Wx.is_complex() else Wx.dtype)
++        else:
++            thr = self.threshold
++
+         # Loop over time axis
+         for t in range(Wx.shape[1]):
+ 
+@@ -1324,8 +1399,10 @@ class RadLIFLayer(nn.Module):
+             )
+ 
+             # Compute spikes with surrogate gradient
+-            st = self.spike_fct(ut - self.threshold)
++            st = self.spike_fct(ut - thr)
+             s.append(st)
++            if self.homeo is not None:
++                thr = self.homeo.step(st)
+ 
+         return torch.stack(s, dim=1)
+ 
+diff --git a/train.py b/train.py
+index 23a5948..08a01a1 100644
+--- a/train.py
++++ b/train.py
+@@ -260,11 +260,13 @@ class Experiment:
+                 filename=self.log_dir + "exp.log",
+                 level=logging.INFO,
+                 format="%(message)s",
++                force=True,
+             )
+         else:
+             logging.basicConfig(
+                 level=logging.INFO,
+                 format="%(message)s",
++                force=True,
+             )
+ 
+     def init_dataset(self):
+@@ -365,7 +367,7 @@ class Experiment:
+         layer_sizes = [self.nb_hiddens] * (self.nb_layers - 1) + [self.nb_outputs]
+ 
+ 
+-        if self.model_type in ["LIF", "CSiLIF", "SiLIF", "adLIF", "CadLIF", "ResonateFire", "S4D", "SS4D", "Mamba"]:
++        if self.model_type in ["LIF", "CSiLIF", "SiLIF", "adLIF", "CadLIF", "ResonateFire", "S4D", "SS4D", "Mamba", "RadLIF"]:
+ 
+             self.net = SNN(
+                 input_shape=input_shape,
